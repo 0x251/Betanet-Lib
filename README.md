@@ -166,8 +166,10 @@
 ### Core APIs 
 
 - Frames: `betanet.core.frames` (`Frame`, `encode_frame`, `decode_frame`, `STREAM`, `KEY_UPDATE`, `WINDOW_UPDATE`)
+- Enums: `betanet.core.enums.FrameType`, `betanet.gateway.enums.TicketCarrier`
 - Session: `betanet.core.session.HtxSession` (encrypt/decrypt frames, flow control, rekey)
 - Transport (TCP): `betanet.transport.tcp.HtxTcpClient`, `HtxTcpServer`
+- Transport base: `betanet.transport.base.TransportClient`, `TransportServer`
 - Transport (async): `betanet.transport.asyncio.AsyncClient`, `AsyncServer`
 - Noise: `betanet.noise.xk` (sync), `betanet.noise.xk_async` (async)
 - Tickets SDK: `betanet.sdk` (helpers), `betanet.tickets` (policy, verifier)
@@ -197,8 +199,118 @@
   curl http://127.0.0.1:8081/json
   ```
 
+### Build your own app (no tickets)
+
+```python
+import threading, os
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+from betanet.transport.upstream_asgi import HtxAsgiServer
+from betanet.gateway.dev import ProxyServer
+
+async def app(scope, receive, send):
+    assert scope["type"] == "http"
+    body = b"hello from asgi"
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
+
+def main():
+    up_host, up_port = "127.0.0.1", 35100
+    gw_host, gw_port = "127.0.0.1", 8082
+
+    srv_priv = X25519PrivateKey.generate()
+    srv_pub = srv_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    srv_priv_raw = srv_priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+    cli_priv = X25519PrivateKey.generate().private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+
+    upstream = HtxAsgiServer(up_host, up_port, srv_priv_raw, app)
+    threading.Thread(target=upstreamServe, args=(upstream,), daemon=True).start()
+
+    gw = ProxyServer(gw_host, gw_port, up_host, up_port, cli_priv, srv_pub, forward_path=True)
+    threading.Thread(target=gw.serve_forever, daemon=True).start()
+
+    print(f"gateway http://{gw_host}:{gw_port}")
+
+def upstreamServe(s):
+    s.serve_forever()
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+python your_app.py
+curl http://127.0.0.1:8082/
+```
+
+### Build your own app (with tickets)
+
+```python
+import threading, os
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+from betanet.transport.upstream_asgi import HtxAsgiServer
+from betanet.gateway.dev import ProxyServer
+from betanet.tickets import TicketVerifier
+from betanet.sdk import make_ticket_params, make_ticket_cookie
+
+COOKIE_NAME = "__Host-bn1"
+
+async def app(scope, receive, send):
+    assert scope["type"] == "http"
+    body = b"ok"
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
+
+def main():
+    up_host, up_port = "127.0.0.1", 35200
+    gw_host, gw_port = "127.0.0.1", 8083
+
+    srv_priv = X25519PrivateKey.generate()
+    srv_pub = srv_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    srv_priv_raw = srv_priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+    cli_priv = X25519PrivateKey.generate().private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+
+    ticket_priv = X25519PrivateKey.generate()
+    ticket_pub = ticket_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    ticket_key_id8 = os.urandom(8)
+
+    upstream = HtxAsgiServer(up_host, up_port, srv_priv_raw, app)
+    threading.Thread(target=upstreamServe, args=(upstream,), daemon=True).start()
+
+    verifier = TicketVerifier(ticket_priv, ticket_key_id8)
+    gw = ProxyServer(gw_host, gw_port, up_host, up_port, cli_priv, srv_pub, ticket_verifier=verifier, ticket_cookie_name=COOKIE_NAME, forward_path=True)
+    threading.Thread(target=gw.serve_forever, daemon=True).start()
+
+    print("server_pub=", srv_pub.hex())
+    print("ticket_pub=", ticket_pub.hex())
+    print("ticket_key_id=", ticket_key_id8.hex())
+    print(f"gateway http://{gw_host}:{gw_port}")
+
+def upstreamServe(s):
+    s.serve_forever()
+
+if __name__ == "__main__":
+    main()
+```
+
+Client with cookie ticket:
+
+```python
+from betanet.sdk import make_ticket_params, make_ticket_cookie
 
 
+ticket_pub_hex = "..."
+ticket_key_id_hex = "..."
 
+params = make_ticket_params(ticket_pub_hex, ticket_key_id_hex)
+cookie, cli_pub, nonce = make_ticket_cookie("__Host-bn1", params)
+print("Cookie:", cookie)
+```
 
+```bash
+curl -H "Cookie: $(python make_cookie.py | sed -n 's/^Cookie: //p')" http://127.0.0.1:8083/
+```
 
