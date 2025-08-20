@@ -1,5 +1,6 @@
 import hashlib
-from typing import List
+from typing import List, Union
+from enum import Enum
 
 from betanet.bootstrap import beacon_set, epoch_day
 
@@ -22,15 +23,21 @@ def pick_nodes(seed: bytes, count: int) -> List[str]:
     return out
 
 
+class PrivacyMode(Enum):
+	STRICT = "strict"
+	BALANCED = "balanced"
+	PERFORMANCE = "performance"
+
+
 def compute_hops(
-    src_peer_id: bytes, dst_peer_id: bytes, stream_nonce: bytes, mode: str, trust: float
+    src_peer_id: bytes, dst_peer_id: bytes, stream_nonce: bytes, mode: Union[str, PrivacyMode], trust: float
 ) -> List[str]:
     ep = epoch_day()
     b = beacon_set(ep)
     seed = sha256(b + src_peer_id + dst_peer_id + stream_nonce)
-    if mode == "strict":
+    if (mode.value if isinstance(mode, PrivacyMode) else mode) == "strict":
         return pick_nodes(seed, 3)
-    if mode == "balanced":
+    if (mode.value if isinstance(mode, PrivacyMode) else mode) == "balanced":
         if trust >= 0.8:
             return []
         return pick_nodes(seed, 2)

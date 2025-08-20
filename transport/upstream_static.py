@@ -97,3 +97,32 @@ class HtxStaticServer:
         finally:
             conn.close()
             s.close()
+
+    def serve_forever(self) -> None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((self.host, self.port))
+        s.listen(64)
+        try:
+            while True:
+                conn, addr = s.accept()
+                try:
+                    k0 = server_handshake_over_socket(conn, self.static_private)
+                    sess = HtxSession(k0, is_client=False)
+                    while True:
+                        buf = recv_frame(conn)
+                        typ, sid, pt, off, out = sess.decrypt_frame(buf, 0)
+                        if typ == STREAM and sid is not None:
+                            data = self.adapter.handle(pt)
+                            reply = sess.encrypt_frame(STREAM, sid, data)
+                            send_frame(conn, reply)
+                            while (p := sess.pop_pending()) is not None:
+                                send_frame(conn, p)
+                        if out:
+                            send_frame(conn, out)
+                except Exception:
+                    pass
+                finally:
+                    conn.close()
+        finally:
+            s.close()

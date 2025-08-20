@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
+from enum import Enum
 from abc import ABC, abstractmethod
 
 
@@ -14,6 +15,12 @@ class AliasRecord:
 
 def two_of_three_finalized(finality: Dict[str, bool]) -> bool:
 	return sum(1 for v in finality.values() if v) >= 2
+
+
+class FinalityChain(Enum):
+	HANDSHAKE = "handshake"
+	FILECOIN = "filecoin"
+	RAVEN_L2 = "raven_l2"
 
 
 def monotonic_seq_ok(prev_seq: Optional[int], new_seq: int) -> bool:

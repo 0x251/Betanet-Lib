@@ -2,12 +2,13 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import os
 import time
-
+import random
 from betanet.core.frames import (
     Frame,
     encode_frame,
     decode_frame,
     STREAM,
+    PING,
     KEY_UPDATE,
     WINDOW_UPDATE,
 )
@@ -54,6 +55,7 @@ class HtxSession:
         self.sent_bytes = 0
         self.sent_frames = 0
         self.last_rekey = time.time()
+        self._next_ping_at = self._now_ms() + self._rand_ms(10000, 60000)
 
     def _flow_for(self, sid: int) -> FlowState:
         st = self.stream_windows.get(sid)
@@ -95,6 +97,19 @@ class HtxSession:
         if not self.pending:
             return None
         return self.pending.pop(0)
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def _rand_ms(self, a: int, b: int) -> int:
+        return random.randint(a, b)
+
+    def maybe_schedule_ping_and_padding(self) -> None:
+        now = self._now_ms()
+        if now >= self._next_ping_at:
+            jitter = int(0.1 * self._rand_ms(0, 1000))
+            self._next_ping_at = now + self._rand_ms(10000, 60000) + jitter
+            self.pending.append(self._seal(PING, None, os.urandom(0)))
 
     def request_key_update(self, transcript_hash: bytes) -> bytes:
         buf = self._seal(KEY_UPDATE, None, transcript_hash)

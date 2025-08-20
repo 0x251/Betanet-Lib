@@ -2,7 +2,8 @@ import socket
 from typing import Optional
 
 from betanet.core.session import HtxSession
-from betanet.core.frames import STREAM
+from betanet.core.frames import STREAM, KEY_UPDATE
+from betanet.transition import make_control_frame, AllowAllPathValidator
 from betanet.transport.base import TransportServer, TransportClient
 from betanet.noise.xk import client_handshake_over_socket, server_handshake_over_socket
 from betanet.transport.upstream_adapter import EchoAdapter
@@ -84,6 +85,11 @@ class HtxTcpServer(TransportServer):
                 pass
             k0 = server_handshake_over_socket(conn, self.static_private)
             sess = HtxSession(k0, is_client=False)
+            try:
+                cf = make_control_frame(sess, prev_as=0, next_as=0)
+                send_frame(conn, cf)
+            except Exception:
+                pass
             adapter = EchoAdapter()
             while True:
                 buf = recv_frame(conn)
@@ -94,6 +100,12 @@ class HtxTcpServer(TransportServer):
                     send_frame(conn, reply)
                     while (p := sess.pop_pending()) is not None:
                         send_frame(conn, p)
+                if typ == KEY_UPDATE:
+                    try:
+                        cf = make_control_frame(sess, prev_as=0, next_as=0)
+                        send_frame(conn, cf)
+                    except Exception:
+                        pass
                 if out:
                     send_frame(conn, out)
         except Exception:
@@ -186,3 +198,43 @@ class HtxTcpClientPersistent:
         resp = recv_frame(self.sock)
         typ, rsid, pt, off, out = self.sess.decrypt_frame(resp, 0)
         return pt or b""
+
+    def rebind(self, host: str, port: int) -> None:
+        if host == self.host and port == self.port:
+            return
+        self.close()
+        self.host = host
+        self.port = port
+
+
+class HtxTcpClientPool:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        initiator_static_private: bytes,
+        responder_static_public: bytes,
+        size: int = 4,
+    ):
+        self.host = host
+        self.port = port
+        self.initiator_static_private = initiator_static_private
+        self.responder_static_public = responder_static_public
+        self.clients: list[HtxTcpClientPersistent] = [
+            HtxTcpClientPersistent(host, port, initiator_static_private, responder_static_public)
+            for _ in range(max(1, size))
+        ]
+        self._idx = 0
+
+    def rebind(self, host: str, port: int) -> None:
+        if host == self.host and port == self.port:
+            return
+        self.host = host
+        self.port = port
+        for c in self.clients:
+            c.rebind(host, port)
+
+    def roundtrip(self, payload: bytes) -> bytes:
+        cli = self.clients[self._idx % len(self.clients)]
+        self._idx = (self._idx + 1) % len(self.clients)
+        return cli.roundtrip(payload)

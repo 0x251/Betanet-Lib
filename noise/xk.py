@@ -1,4 +1,8 @@
 import socket
+import os
+import logging
+
+
 from noise.connection import NoiseConnection, Keypair
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -10,10 +14,22 @@ def hkdf_from_hash(h: bytes) -> bytes:
     ).derive(h)
 
 
+def _create_noise(pq: bool) -> NoiseConnection:
+    name_legacy = b"Noise_XK_25519_ChaChaPoly_SHA256"
+    if pq:
+        try:
+            name_hybrid = b"Noise_XK_25519_Kyber768_ChaChaPoly_SHA256"
+            return NoiseConnection.from_name(name_hybrid)
+        except Exception:
+            logging.getLogger("betanet").info("pq_unsupported_fallback")
+    return NoiseConnection.from_name(name_legacy)
+
+
 def client_handshake_over_socket(
     sock: socket.socket, initiator_static_private: bytes, responder_static_public: bytes
 ) -> bytes:
-    n = NoiseConnection.from_name(b"Noise_XK_25519_ChaChaPoly_SHA256")
+    pq = os.environ.get("BETANET_PQ", "0") == "1"
+    n = _create_noise(pq)
     n.set_as_initiator()
     n.set_keypair_from_private_bytes(Keypair.STATIC, initiator_static_private)
     n.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, responder_static_public)
@@ -31,7 +47,8 @@ def client_handshake_over_socket(
 def server_handshake_over_socket(
     sock: socket.socket, responder_static_private: bytes
 ) -> bytes:
-    n = NoiseConnection.from_name(b"Noise_XK_25519_ChaChaPoly_SHA256")
+    pq = os.environ.get("BETANET_PQ", "0") == "1"
+    n = _create_noise(pq)
     n.set_as_responder()
     n.set_keypair_from_private_bytes(Keypair.STATIC, responder_static_private)
     n.start_handshake()

@@ -1,10 +1,10 @@
 import os
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Protocol
+import threading
 
 from betanet.core.session import HtxSession
 from betanet.core.frames import STREAM
-
 
 
 def _cbor_encode_uint(n: int) -> bytes:
@@ -87,13 +87,13 @@ def _cbor_expect(data: bytes, pos: int, want_major: int) -> Tuple[int, int, int]
         val = data[pos]
         pos += 1
     elif addl == 25:
-        val = int.from_bytes(data[pos:pos+2], "big")
+        val = int.from_bytes(data[pos : pos + 2], "big")
         pos += 2
     elif addl == 26:
-        val = int.from_bytes(data[pos:pos+4], "big")
+        val = int.from_bytes(data[pos : pos + 4], "big")
         pos += 4
     elif addl == 27:
-        val = int.from_bytes(data[pos:pos+8], "big")
+        val = int.from_bytes(data[pos : pos + 8], "big")
         pos += 8
     else:
         raise ValueError("indefinite not supported")
@@ -102,13 +102,13 @@ def _cbor_expect(data: bytes, pos: int, want_major: int) -> Tuple[int, int, int]
 
 def _cbor_decode_tstr(data: bytes, pos: int) -> Tuple[str, int]:
     l, addl, pos = _cbor_expect(data, pos, 3)
-    s = data[pos:pos+l].decode("utf-8")
+    s = data[pos : pos + l].decode("utf-8")
     return s, pos + l
 
 
 def _cbor_decode_bstr(data: bytes, pos: int) -> Tuple[bytes, int]:
     l, addl, pos = _cbor_expect(data, pos, 2)
-    b = data[pos:pos+l]
+    b = data[pos : pos + l]
     return b, pos + l
 
 
@@ -134,7 +134,9 @@ def cbor_decode_map(data: bytes) -> Dict[str, object]:
     return out
 
 
-def build_control_payload(prev_as: int, next_as: int, ts: int, flow: bytes, nonce: bytes, sig: bytes) -> bytes:
+def build_control_payload(
+    prev_as: int, next_as: int, ts: int, flow: bytes, nonce: bytes, sig: bytes
+) -> bytes:
     m = {
         "prevAS": prev_as,
         "nextAS": next_as,
@@ -154,8 +156,34 @@ def make_control_frame(sess: HtxSession, prev_as: int, next_as: int) -> bytes:
     ts = int(time.time())
     flow = os.urandom(8)
     nonce = os.urandom(8)
-    sig = os.urandom(64)  # placeholder
+    sig = os.urandom(64) 
     payload = build_control_payload(prev_as, next_as, ts, flow, nonce, sig)
     return sess.encrypt_frame(STREAM, 2, payload)
 
 
+class PathValidator(Protocol):
+    def validate(self, prev_as: int, next_as: int, now_ts: int) -> bool: ...
+
+
+class AllowAllPathValidator:
+    def validate(self, prev_as: int, next_as: int, now_ts: int) -> bool:
+        return True
+
+
+class ControlStreamGuard:
+    def __init__(self):
+        self._seen: Dict[Tuple[int, int], float] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, flow: bytes, ts: int) -> bool:
+        now = int(time.time())
+        if abs(now - ts) > 300:
+            return False
+        key = (int.from_bytes(flow, "big"), ts)
+        with self._lock:
+            cut = time.time() - 2 * 3600
+            self._seen = {k: t for k, t in self._seen.items() if t >= cut}
+            if key in self._seen:
+                return False
+            self._seen[key] = time.time()
+            return True

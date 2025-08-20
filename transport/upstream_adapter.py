@@ -2,12 +2,19 @@ import os
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Callable, Tuple, Optional
+from enum import Enum
 
 
 class UpstreamAdapter(ABC):
 	@abstractmethod
 	def handle(self, payload: bytes) -> bytes:
 		raise NotImplementedError
+
+
+class UpstreamType(Enum):
+	ECHO = "echo"
+	ASGI = "asgi"
+	STATIC = "static"
 
 
 class EchoAdapter(UpstreamAdapter):

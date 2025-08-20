@@ -1,8 +1,11 @@
 import socket
 from typing import Optional
+import h11
 import logging
 
-from betanet.transport.tcp import HtxTcpClient, HtxTcpClientPersistent
+from betanet.transport.tcp import HtxTcpClientPersistent
+from betanet.transport.fallback import roundtrip_with_udp_fallback
+from betanet.path import PathManager, PathEndpoint
 from betanet.gateway.enums import TicketCarrier, HttpMethod
 from betanet.gateway.types import RequestHead, UpstreamMessage
 from betanet.tickets import TicketVerifier
@@ -33,6 +36,71 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _read_request(
+    conn: socket.socket,
+    max_header: int = 1 << 16,
+    max_body: int = 1 << 20,
+    max_headers: int = 64,
+    max_header_line: int = 8192,
+):
+    conn.settimeout(5.0)
+    c = h11.Connection(h11.SERVER)
+    headers = {}
+    method = b"GET"
+    target = b"/"
+    body_chunks: list[bytes] = []
+    total = 0
+    header_count = 0
+    while True:
+        event = c.next_event()
+        if event is h11.NEED_DATA:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed")
+            total += len(chunk)
+            if total > max_header + max_body:
+                raise ConnectionError("too large")
+            c.receive_data(chunk)
+            continue
+        if isinstance(event, h11.Request):
+            method = event.method.upper()
+            target = event.target
+            for k, v in event.headers:
+                headers[k.lower()] = v.strip()
+                header_count += 1
+                if (
+                    header_count > max_headers
+                    or len(k) > max_header_line
+                    or len(v) > max_header_line
+                ):
+                    raise ConnectionError("headers too large")
+        elif isinstance(event, h11.Data):
+            body_chunks.append(event.data)
+            if sum(len(x) for x in body_chunks) > max_body:
+                raise ConnectionError("body too large")
+        elif isinstance(event, h11.EndOfMessage):
+            body = b"".join(body_chunks)
+            return method, target, headers, body, c
+        else:
+            continue
+
+
+def _send_response(
+    conn: socket.socket,
+    c: h11.Connection,
+    status: int,
+    body: bytes,
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
+    if headers is None:
+        headers = []
+    hdrs = [(b"content-length", str(len(body)).encode())] + headers
+    conn.sendall(c.send(h11.Response(status_code=status, headers=hdrs)))
+    if body:
+        conn.sendall(c.send(h11.Data(data=body)))
+    conn.sendall(c.send(h11.EndOfMessage()))
+
+
 class ProxyServer:
     def __init__(
         self,
@@ -45,6 +113,7 @@ class ProxyServer:
         ticket_verifier: Optional[TicketVerifier] = None,
         ticket_cookie_name: Optional[str] = None,
         forward_path: bool = False,
+        transport: str = "tcp",
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -55,7 +124,11 @@ class ProxyServer:
         self.ticket_verifier = ticket_verifier
         self.ticket_cookie_name = ticket_cookie_name
         self.forward_path = forward_path
+        self.transport = (transport or "tcp").lower().strip()
         self.up_client: Optional[HtxTcpClientPersistent] = None
+        self.paths = PathManager(
+            [PathEndpoint(upstream_host, upstream_port)], max_paths=3
+        )
 
     def serve_once(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -73,50 +146,38 @@ class ProxyServer:
             except Exception:
                 pass
             logger.info("conn addr=%s", addr)
-            raw = recv_until(conn, b"\r\n\r\n")
-            head_end = raw.find(b"\r\n\r\n")
-            head = raw[: head_end + 4]
-            body = raw[head_end + 4 :]
-            req_line = head.split(b"\r\n", 1)[0]
-            logger.info("req_line %r", req_line)
-            path = b"/"
             try:
-                parts = req_line.split()
-                if len(parts) >= 2:
-                    path = parts[1]
-                method_bytes = parts[0].upper() if parts else b"GET"
-            except Exception:
-                path = b"/"
-                method_bytes = b"GET"
-            cl = 0
-            headers = {}
-            for line in head.split(b"\r\n"):
-                if b":" in line:
-                    k, v = line.split(b":", 1)
-                    headers[k.strip()] = v.strip()
-                if line.lower().startswith(b"content-length:"):
-                    try:
-                        cl = int(line.split(b":", 1)[1].strip() or b"0")
-                    except Exception:
-                        cl = 0
-            break_needed = len(body) < cl
-            if break_needed:
-                body += recv_exact(conn, cl - len(body))
-            
+                method_bytes, target, headers, body, c = _read_request(conn)
+            except Exception as e:
+                emsg = str(e).lower()
+                c = h11.Connection(h11.SERVER)
+                if (
+                    "headers too large" in emsg
+                    or "header too large" in emsg
+                    or "headers too big" in emsg
+                ):
+                    _send_response(conn, c, 431, b"")
+                    return
+                if "body too large" in emsg or "too large" in emsg:
+                    _send_response(conn, c, 413, b"")
+                    return
+                _send_response(conn, c, 400, b"")
+                return
+            path = target
+
             if self.ticket_verifier is not None and self.ticket_cookie_name:
                 carrier = None
                 val = None
-                
-                for line in head.split(b"\r\n"):
-                    if line.lower().startswith(b"cookie:"):
-                        cookie_line = line.split(b":", 1)[1].strip()
-                        parts = [p.strip() for p in cookie_line.split(b";")]
-                        for p in parts:
-                            needle = self.ticket_cookie_name.encode() + b"="
-                            if p.startswith(needle):
-                                val = p.split(b"=", 1)[1].decode()
-                                carrier = TicketCarrier.COOKIE.value
-                                break
+
+                cv = headers.get(b"cookie")
+                if cv is not None:
+                    parts = [p.strip() for p in cv.split(b";")]
+                    for p in parts:
+                        needle = self.ticket_cookie_name.encode() + b"="
+                        if p.startswith(needle):
+                            val = p.split(b"=", 1)[1].decode()
+                            carrier = TicketCarrier.COOKIE.value
+                            break
                 # query
                 if val is None:
                     q = path.split(b"?", 1)
@@ -127,12 +188,8 @@ class ProxyServer:
                                 carrier = TicketCarrier.QUERY.value
                                 break
                 # form body
-                if val is None and cl > 0:
-                    ctype = b""
-                    for line in head.split(b"\r\n"):
-                        if line.lower().startswith(b"content-type:"):
-                            ctype = line.split(b":", 1)[1].strip().lower()
-                            break
+                if val is None and body:
+                    ctype = headers.get(b"content-type", b"").lower()
                     if b"application/x-www-form-urlencoded" in ctype:
                         for part in body.split(b"&"):
                             if part.startswith(b"bn1="):
@@ -142,7 +199,7 @@ class ProxyServer:
                 logger.info("carrier %s", carrier)
                 if not val:
                     logger.warning("forbid reason=no_ticket")
-                    conn.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                    _send_response(conn, c, 403, b"")
                     return
                 ip = conn.getpeername()[0]
                 logger.info("client_ip %s", ip)
@@ -150,43 +207,74 @@ class ProxyServer:
                 logger.info("ticket_ok %s", ok)
                 if not ok:
                     logger.warning("forbid reason=bad_ticket")
-                    conn.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                    _send_response(conn, c, 403, b"")
                     return
-            logger.info("content_length %d body_len %d", cl, len(body))
+            try:
+                cl_val = int(
+                    headers.get(b"content-length", b"0").decode(errors="ignore") or "0"
+                )
+            except Exception:
+                cl_val = 0
+            logger.info("content_length %d body_len %d", cl_val, len(body))
             try:
                 method = HttpMethod(method_bytes.decode(errors="ignore") or "GET")
             except Exception:
                 method = HttpMethod.GET
-            req_obj = RequestHead(method=method, path=path, headers=headers, content_length=cl)
+            req_obj = RequestHead(
+                method=method, path=path, headers=headers, content_length=len(body)
+            )
             if not self.forward_path:
-                umsg = UpstreamMessage(method=req_obj.method, path=req_obj.path, body=body)
+                umsg = UpstreamMessage(
+                    method=req_obj.method, path=req_obj.path, body=body
+                )
                 payload = umsg.body
             else:
                 if method == HttpMethod.POST:
-                    umsg = UpstreamMessage(method=req_obj.method, path=req_obj.path, body=b"POST " + path + b"\n\n" + body)
+                    umsg = UpstreamMessage(
+                        method=req_obj.method,
+                        path=req_obj.path,
+                        body=b"POST " + path + b"\n\n" + body,
+                    )
                 else:
-                    umsg = UpstreamMessage(method=req_obj.method, path=req_obj.path, body=b"GET " + path)
+                    umsg = UpstreamMessage(
+                        method=req_obj.method, path=req_obj.path, body=b"GET " + path
+                    )
                 payload = umsg.body
-            if self.up_client is None:
-                self.up_client = HtxTcpClientPersistent(
-                    self.upstream_host,
-                    self.upstream_port,
-                    self.client_priv,
-                    self.server_pub,
-                )
-            resp_body = self.up_client.roundtrip(payload)
+            cur = self.paths.maybe_switch() or self.paths.current()
+            import time as _t
+
+            _t0 = _t.perf_counter()
+            try:
+                if self.transport == "quic":
+                    resp_body = roundtrip_with_udp_fallback(
+                        cur.host,
+                        cur.port,
+                        self.client_priv,
+                        self.server_pub,
+                        1,
+                        payload,
+                        sleep_ms=lambda ms: None,
+                    )
+                else:
+                    if self.up_client is None:
+                        self.up_client = HtxTcpClientPersistent(
+                            cur.host, cur.port, self.client_priv, self.server_pub
+                        )
+                    else:
+                        self.up_client.rebind(cur.host, cur.port)
+                    resp_body = self.up_client.roundtrip(payload)
+                self.paths.mark_ok(cur.host, cur.port, (_t.perf_counter() - _t0) * 1000)
+            except Exception:
+                self.paths.mark_fail(cur.host, cur.port)
+                raise
             logger.info("resp_len %d", len(resp_body))
-            resp = (
-                b"HTTP/1.1 200 OK\r\nContent-Length: "
-                + str(len(resp_body)).encode()
-                + b"\r\nConnection: close\r\n\r\n"
-                + resp_body
-            )
-            conn.sendall(resp)
+            _send_response(conn, c, 200, resp_body)
         except Exception as e:
             logger.error("proxy_exception err=%r", e)
             try:
-                conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                _send_response(
+                    conn, c if "c" in locals() else h11.Connection(h11.SERVER), 502, b""
+                )
             except Exception:
                 pass
         finally:
@@ -210,44 +298,40 @@ class ProxyServer:
                 except Exception:
                     pass
                 logger.info("conn addr=%s", addr)
-                raw = recv_until(conn, b"\r\n\r\n")
-                head_end = raw.find(b"\r\n\r\n")
-                head = raw[: head_end + 4]
-                body = raw[head_end + 4 :]
-                req_line = head.split(b"\r\n", 1)[0]
-                logger.info("req_line %r", req_line)
-                path = b"/"
                 try:
-                    parts = req_line.split()
-                    if len(parts) >= 2:
-                        path = parts[1]
-                except Exception:
-                    path = b"/"
-                cl = 0
-                for line in head.split(b"\r\n"):
-                    if line.lower().startswith(b"content-length:"):
-                        try:
-                            cl = int(line.split(b":", 1)[1].strip() or b"0")
-                        except Exception:
-                            cl = 0
-                break_needed = len(body) < cl
-                if break_needed:
-                    body += recv_exact(conn, cl - len(body))
-                
+                    method_bytes, path, headers, body, c = _read_request(conn)
+                except Exception as e:
+                    emsg = str(e).lower()
+                    c = h11.Connection(h11.SERVER)
+                    if (
+                        "headers too large" in emsg
+                        or "header too large" in emsg
+                        or "headers too big" in emsg
+                    ):
+                        _send_response(conn, c, 431, b"")
+                        conn.close()
+                        continue
+                    if "body too large" in emsg or "too large" in emsg:
+                        _send_response(conn, c, 413, b"")
+                        conn.close()
+                        continue
+                    _send_response(conn, c, 400, b"")
+                    conn.close()
+                    continue
+
                 if self.ticket_verifier is not None and self.ticket_cookie_name:
                     carrier = None
                     val = None
                     # cookie
-                    for line in head.split(b"\r\n"):
-                        if line.lower().startswith(b"cookie:"):
-                            cookie_line = line.split(b":", 1)[1].strip()
-                            parts = [p.strip() for p in cookie_line.split(b";")]
-                            for p in parts:
-                                needle = self.ticket_cookie_name.encode() + b"="
-                                if p.startswith(needle):
-                                    val = p.split(b"=", 1)[1].decode()
-                                    carrier = TicketCarrier.COOKIE.value
-                                    break
+                    cv = headers.get(b"cookie")
+                    if cv is not None:
+                        parts = [p.strip() for p in cv.split(b";")]
+                        for p in parts:
+                            needle = self.ticket_cookie_name.encode() + b"="
+                            if p.startswith(needle):
+                                val = p.split(b"=", 1)[1].decode()
+                                carrier = TicketCarrier.COOKIE.value
+                                break
                     # query
                     if val is None:
                         q = path.split(b"?", 1)
@@ -258,12 +342,8 @@ class ProxyServer:
                                     carrier = TicketCarrier.QUERY.value
                                     break
                     # form body
-                    if val is None and cl > 0:
-                        ctype = b""
-                        for line in head.split(b"\r\n"):
-                            if line.lower().startswith(b"content-type:"):
-                                ctype = line.split(b":", 1)[1].strip().lower()
-                                break
+                    if val is None and body:
+                        ctype = headers.get(b"content-type", b"").lower()
                         if b"application/x-www-form-urlencoded" in ctype:
                             for part in body.split(b"&"):
                                 if part.startswith(b"bn1="):
@@ -273,9 +353,7 @@ class ProxyServer:
                     logger.info("carrier %s", carrier)
                     if not val:
                         logger.warning("forbid reason=no_ticket")
-                        conn.sendall(
-                            b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
-                        )
+                        _send_response(conn, c, 403, b"")
                         conn.close()
                         continue
                     ip = conn.getpeername()[0]
@@ -284,48 +362,64 @@ class ProxyServer:
                     logger.info("ticket_ok %s", ok)
                     if not ok:
                         logger.warning("forbid reason=bad_ticket")
-                        conn.sendall(
-                            b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
-                        )
+                        _send_response(conn, c, 403, b"")
                         conn.close()
                         continue
-                logger.info("content_length %d body_len %d", cl, len(body))
-             
+                try:
+                    cl_val = int(
+                        headers.get(b"content-length", b"0").decode(errors="ignore")
+                        or "0"
+                    )
+                except Exception:
+                    cl_val = 0
+                logger.info("content_length %d body_len %d", cl_val, len(body))
+
                 if not self.forward_path:
                     payload = body
                 else:
-                    method = b"GET"
-                    try:
-                        parts = req_line.split()
-                        if parts:
-                            method = parts[0].upper()
-                    except Exception:
-                        method = b"GET"
-                    if method == b"POST":
+                    if method_bytes == b"POST":
                         payload = b"POST " + path + b"\n\n" + body
                     else:
                         payload = b"GET " + path
-                if self.up_client is None:
-                    self.up_client = HtxTcpClientPersistent(
-                        self.upstream_host,
-                        self.upstream_port,
-                        self.client_priv,
-                        self.server_pub,
+                cur = self.paths.maybe_switch() or self.paths.current()
+                import time as _t
+
+                _t0 = _t.perf_counter()
+                try:
+                    if self.transport == "quic":
+                        resp_body = roundtrip_with_udp_fallback(
+                            cur.host,
+                            cur.port,
+                            self.client_priv,
+                            self.server_pub,
+                            1,
+                            payload,
+                            sleep_ms=lambda ms: None,
+                        )
+                    else:
+                        if self.up_client is None:
+                            self.up_client = HtxTcpClientPersistent(
+                                cur.host, cur.port, self.client_priv, self.server_pub
+                            )
+                        else:
+                            self.up_client.rebind(cur.host, cur.port)
+                        resp_body = self.up_client.roundtrip(payload)
+                    self.paths.mark_ok(
+                        cur.host, cur.port, (_t.perf_counter() - _t0) * 1000
                     )
-                resp_body = self.up_client.roundtrip(payload)
+                except Exception:
+                    self.paths.mark_fail(cur.host, cur.port)
+                    raise
                 logger.info("resp_len %d", len(resp_body))
-                resp = (
-                    b"HTTP/1.1 200 OK\r\nContent-Length: "
-                    + str(len(resp_body)).encode()
-                    + b"\r\nConnection: close\r\n\r\n"
-                    + resp_body
-                )
-                conn.sendall(resp)
+                _send_response(conn, c, 200, resp_body)
             except Exception as e:
                 logger.error("proxy_exception err=%r", e)
                 try:
-                    conn.sendall(
-                        b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+                    _send_response(
+                        conn,
+                        c if "c" in locals() else h11.Connection(h11.SERVER),
+                        502,
+                        b"",
                     )
                 except Exception:
                     pass
