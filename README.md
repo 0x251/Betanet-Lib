@@ -1,5 +1,6 @@
 # Betanet Python Library
 
+Updated to 1.2v PR requirement's (:
 
 ### structure
 
@@ -8,55 +9,74 @@
 - `betanet/noise`: Noise XK (sync+async)
 - `betanet/bitswap`: demo TCP bitswap
 - `betanet/gateway`: HTTP→HTX dev gateway
-- `apps`: runnable scripts and templates
+- `server`: website templates
 
-### demos
 
-- Echo over HTX (no args):
-  - Starts upstream echo and gateway, prints gateway URL
-  ```bash
-  python apps/run.py
-  curl -X POST -d "hello" http://127.0.0.1:8080/echo
-  ```
-
-- ASGI over HTX:
-  - Runs the ASGI template behind the HTX gateway
-  ```bash
-  python apps/run_asgi.py
-  curl http://127.0.0.1:8081/
-  curl http://127.0.0.1:8081/json
-  ```
-
-- From config (TOML):
-  ```bash
-  python apps/start_from_config.py gateway apps/templates/config/gateway.toml
-  curl -X POST -d "hi" http://127.0.0.1:8080/echo
-  ```
-
-- Static (plain HTTP):
-  ```bash
-  python apps/dev_server.py --mode static --root apps/templates/static_site --port 9000
-  # Visit http://127.0.0.1:9000/
-  ```
-
-### Templates
-
-- `apps/templates/static_site`: single-file static page for the dev server
-- `apps/templates/asgi_app/app.py`: minimal ASGI entrypoint (no deps)
-- `apps/templates/asgi_app_advanced/app.py`: routing and JSON example
-- `apps/templates/config/gateway.toml`: sample gateway config for `start_from_config.py`
-- `apps/templates/gateway_ticket_policy.md`: example BN-Ticket policy header
-
-### HTX runner details
+### HTX runner details 
 
 - Gateway: `betanet.gateway.dev.ProxyServer`
-- Upstream echo: `betanet.transport.tcp.HtxTcpServer`
-- Upstream static files: `betanet.transport.upstream_static.HtxStaticServer`
-- Upstream ASGI: `betanet.transport.upstream_asgi.HtxAsgiServer`
+- Upstream (tcp12): `betanet.transport.tcp12.Tcp12Server`
+- Legacy upstreams (1.1 demos): `betanet.transport.tcp.HtxTcpServer`,
+  `betanet.transport.upstream_static.HtxStaticServer`, `betanet.transport.upstream_asgi.HtxAsgiServer`
+
+For the recommended path, use the ServerRunner/CLI:
+
+```bash
+python -m server.run serve --config server/example.toml --plugin server.plugins.dashboard --plugin server.plugins.metrics --templates server/templates
+```
+=
 
 
 
 
+
+### Additional features (1.2)
+
+- Transports
+  - tcp: legacy 1.1 framing over TCP (`betanet.transport.tcp`)
+  - tcp12: 1.2 framing with capability exchange (`betanet.transport.tcp12`)
+  - quic: outer/l4 experiments; gateway can try QUIC then fall back to TCP
+- PQ toggle
+  - Set `BETANET_PQ=1` to enable hybrid Noise name if available; otherwise it falls back automatically
+- Capability exchange (tcp12)
+  - Server advertises caps on StreamID=1; client sends its caps then selection
+  - APIs: `encode_cap_msg`, `decode_cap_msg`, `decide_selection`, `encode_sel_msg`, `decode_sel_msg`
+- BN‑Ticket header helper
+  - `betanet.core.bn_ticket.validate_header(name, value)` verifies `BN-Ticket` format (`v=v1; tok=<base64url 120 bytes>[; ctx=token]`)
+- Vouchers (L6)
+  - `betanet.payments.parse_voucher` parses 128‑byte vouchers; `PaymentsVerifier` rate‑limits per keyset and peer
+  - Gateway: `require_voucher` and `voucher_header` in config enforce vouchers (403 otherwise)
+- Cover decoy fallback
+  - UDP/QUIC attempt then TCP fallback with optional cover connections
+  - Env `BETANET_COVER_DECOYS="host1:443,host2:443"` enables background short‑lived TCP covers during fallback
+  - Dev fast path: set `BETANET_DEV_FAST=1` to skip local backoff delays
+- Calibration & TemplateID
+  - CLI: `python -m server.run calibrate --origin example.com:443 --pop local`
+  - Files are stored under `BETANET_FP_DIR` if set, otherwise OS‑appropriate data dir
+  - Policy is DEV by default; REQUIRED will fail on mismatch
+- HTTP gateway transports
+  - Configurable per `server/example.toml` with `[gateway].transport` = `tcp12` | `tcp`
+  - Path forwarding: set `forward_path=True` to send `GET /path` or `POST /path` bodies upstream
+- Server plugins & BAR bridge
+  - Plugins expose `register(app)`; `server.app.BetanetApp` routes map to BAR via `app.handle_bar`
+  - Static files via `app.add_static(b"/static", "server/templates")`
+- Metrics
+  - `/metrics` exposes Prometheus text including request/error counters and response latencies (avg/last)
+
+### CLI tools
+
+- Tickets
+  - `python -m betanet.cli ticket <ticket_pub_hex> <ticket_key_id_hex> <site_name>` → prints cookie/query/body examples
+- Stream echo
+  - `python -m betanet.cli stream <host> <port> <server_pub_hex> <data>` → opens a tcp echo stream via HTX
+
+### Environment variables
+
+- `BETANET_PROFILE` = MINIMAL | STANDARD | EXTENDED (gateway behavior)
+- `BETANET_PQ` = 1 to prefer hybrid Noise where supported
+- `BETANET_FP_DIR` = directory for calibration fingerprints/templates
+- `BETANET_COVER_DECOYS` = comma‑separated `host:port` list for cover fallback
+- `BETANET_DEV_FAST` = 1 to skip certain artificial delays in local dev
 
 ### cryptography and keys
 
@@ -67,17 +87,9 @@
   - Runs between gateway (initiator) and upstream (responder) using X25519; derives a shared secret K0 via HKDF and splits into per-direction keys. Nonces are derived with per-direction salts and a monotonically increasing counter.
   - Rekeying occurs based on limits (bytes, frames, time).
 - Outer tunnel
-  - inner handshake and frames inside an origin-mirrored TLS/QUIC tunnel. The demos run the inner handshake directly over TCP for simplicity. Production deployments should embed HTX in the mirrored outer tunnel.
+  - inner handshake and frames inside an origin-mirrored TLS/QUIC tunnel
 
-### Demos
 
-- `apps/run.py`
-  - upstream: `HtxTcpServer(host, port, server_priv_raw, server_pub)`
-  - gateway: `ProxyServer(listen_host, listen_port, upstream_host, upstream_port, client_priv, server_pub, forward_path=...)`
-  - `server_priv_raw`: upstream's static private key (bytes)
-  - `server_pub`: upstream's static public key (bytes) shared with the gateway
-  - `client_priv`: gateway's initiator private key for the inner handshake
-  - In the demo, keys are generated in-process for convenience. Do not print or log private keys in production.
 
 ### Tickets (BN‑Ticket)
 
@@ -86,82 +98,7 @@
 ### Frames, streams
 
 - The gateway/gateway-uplink exchange encrypted frames (`STREAM`, `WINDOW_UPDATE`, `KEY_UPDATE`). Payloads for application streams are opaque to the transport.
-- In `betanet.transport.upstream_asgi.HtxAsgiServer`, the upstream decodes the payload into a minimal method+path+body tuple for the ASGI app and returns only the body; the gateway wraps it into an HTTP/1.1 response to the client.
 
-### Logging
-
-  - `echo time_ms`, `gateway time_ms`, `upstream time_ms` for server/gateway loops.
-  - ASGI handlers log: `method, path, status, bytes, time_ms`.
-
-
-
-
-### Apps (tools & scripts)
-
-- start_server.py
-  - Start an HTX echo server or an HTTP→HTX gateway with ticket enforcement.
-  - Echo:
-    ```bash
-    python apps/start_server.py echo 127.0.0.1 35000
-    ```
-  - Gateway (starts an echo upstream in a thread, then the gateway):
-    ```bash
-    python apps/start_server.py gateway 127.0.0.1 8080 127.0.0.1 35000 __Host-bn1 4142434445464748
-    ```
-
-- start_from_config.py
-  - Start echo or gateway from TOML.
-  - Echo:
-    ```bash
-    python apps/start_from_config.py echo apps/templates/config/gateway.toml
-    ```
-  - Gateway:
-    ```bash
-    python apps/start_from_config.py gateway apps/templates/config/gateway.toml
-    ```
-
-- dev_server.py
-  - Local helper server for static HTTP files or simple POST echo.
-  - Static site:
-    ```bash
-    python apps/dev_server.py --mode static --root apps/templates/static_site --port 9000
-    ```
-
-- gateway_server.py
-  - Standalone HTTP→HTX gateway runner.
-  ```bash
-  python apps/gateway_server.py 127.0.0.1 8080 
-  ```
-
-- dev_gateway_preview.py
-  - Minimal preview for the gateway object; useful for tinkering with code paths.
-  ```bash
-  python apps/dev_gateway_preview.py
-  ```
-
-- static_upstream.py
-  - HTX upstream server that serves files from a directory.
-  ```bash
-  python apps/static_upstream.py 127.0.0.1 35000 apps/templates/static_site
-  ```
-
-- client_cli.py
-  - CLI client to send a single HTX request to a server and print the response.
-  ```bash
-  python apps/client_cli.py 127.0.0.1 35000 <server_pub_hex> "hello"
-  ```
-
-- gateway_client.py
-  - Example client for talking to the gateway (ticket paths).
-
-- cas_http.py
-  - Minimal HTTP wrapper around the content store to PUT/GET blocks.
-
-- run.py
-  - No-args demo: upstream echo + gateway.
-
-- run_asgi.py
-  - No-args demo: ASGI behind HTX gateway.
 
 ### Core APIs 
 
@@ -193,56 +130,137 @@
   assert client.roundtrip(1, b"hello") == b"hello"
   ```
 
-- ASGI behind HTX gateway:
-  ```bash
-  python apps/run_asgi.py
-  curl http://127.0.0.1:8081/json
-  ```
 
-### Build your own app (no tickets)
+### Build your own app 
+
+bootstraper using ServerRunner:
 
 ```python
-import threading, os
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives import serialization
+from server.main import ServerRunner, RunnerOptions
 
-from betanet.transport.upstream_asgi import HtxAsgiServer
-from betanet.gateway.dev import ProxyServer
-
-async def app(scope, receive, send):
-    assert scope["type"] == "http"
-    body = b"hello from asgi"
-    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", str(len(body)).encode())]})
-    await send({"type": "http.response.body", "body": body})
-
-def main():
-    up_host, up_port = "127.0.0.1", 35100
-    gw_host, gw_port = "127.0.0.1", 8082
-
-    srv_priv = X25519PrivateKey.generate()
-    srv_pub = srv_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-    srv_priv_raw = srv_priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
-    cli_priv = X25519PrivateKey.generate().private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
-
-    upstream = HtxAsgiServer(up_host, up_port, srv_priv_raw, app)
-    threading.Thread(target=upstreamServe, args=(upstream,), daemon=True).start()
-
-    gw = ProxyServer(gw_host, gw_port, up_host, up_port, cli_priv, srv_pub, forward_path=True)
-    threading.Thread(target=gw.serve_forever, daemon=True).start()
-
-    print(f"gateway http://{gw_host}:{gw_port}")
-
-def upstreamServe(s):
-    s.serve_forever()
-
-if __name__ == "__main__":
-    main()
+opts = RunnerOptions(
+    plugin_modules=["server.plugins.dashboard", "server.plugins.metrics"],
+    plugin_dirs=["server/plugins"],
+    template_roots=["server/templates"],
+    pool_size=4,
+    verbose=False,
+)
+ServerRunner("server/example.toml", opts).start()
 ```
+
+
+# Betanet Server Developer Guide 
+
+#### Quick start
+
+Start with dashboard + metrics plugins and extra template root:
 
 ```bash
-python your_app.py
-curl http://127.0.0.1:8082/
+python -m server.run serve \
+  --config server/example.toml \
+  --plugin server.plugins.dashboard \
+  --plugin server.plugins.metrics \
+  --plugin-dir server/plugins \
+  --templates server/templates \
+  --pool-size 4 \
+  --log-level INFO
 ```
+
+Open:
+- Dashboard: http://127.0.0.1:8082/dashboard
+- Metrics:   http://127.0.0.1:8082/metrics
+
+#### Plugins & routes
+
+Create `test_plugin_1.py`:
+
+```python
+from server.app import BetanetApp
+from server.core import Request, Response
+
+def register(app: BetanetApp) -> None:
+    @app.route(b"GET", b"/hello/{name}")
+    def hello(req: Request) -> Response:
+        name = (req.params or {}).get("name", "world")
+        return app.text(f"hello {name}")
+```
+
+Load it:
+
+```bash
+python -m server.run serve --config server/example.toml --plugin test_plugin_1
+```
+
+Scan a directory/package for plugins:
+
+```bash
+python -m server.run serve --config server/example.toml --plugin-dir server/plugins
+```
+
+Blueprint-style mounting:
+
+```python
+def register(app: BetanetApp):
+    def info(req: Request) -> Response: return app.json({"ok": True})
+    routes = [(b"GET", b"/info", info)]
+    app.blueprint(b"/api", routes)
+```
+
+#### Templates
+
+- Add template roots: `--templates server/templates` or `app.add_template_root("server/templates")`.
+- Render: `app.render_template("dashboard.html", {"title": "Home"})` → pass to `app.html(...)`.
+- Placeholders: `{{ var }}` (escaped), `{{ raw | safe }}` (unescaped).
+- Templates are mtime-cached; edits invalidate automatically.
+
+#### Hooks & error handlers
+
+```python
+@app.before_request
+def log_request(req): ...
+
+@app.after_request
+def add_header(req, resp): ...
+
+def not_found(req, err):
+    return app.error(404, "missing")
+app.error_handler(404, not_found)
+```
+
+#### Static files
+
+Serve files from a directory under a URL prefix (with cache headers):
+
+```python
+app.add_static(b"/static", "server/templates")
+```
+
+#### Response helpers
+
+- `app.json(obj, status=200)`
+- `app.text(str, status=200)`
+- `app.html(bytes_or_str, status=200)`
+- `app.redirect(url, status=302)`
+- `app.error(status, msg="")`
+
+#### Metrics
+
+- `server.plugins.metrics` exposes `/metrics` (Prometheus text) with counters and latencies.
+
+#### CLI flags
+
+- `--plugin MODULE` (repeatable)
+- `--plugin-dir PATH` (repeatable)
+- `--templates DIR` (repeatable)
+- `--pool-size N`
+- `--verbose` / `--quiet`
+- `--log-level LEVEL`
+
+#### Production notes
+
+- Use BAR native clients
+- Enable STANDARD profile (`BETANET_PROFILE=STANDARD`) and disable dev shortcuts.
+- Add process supervision, health checks, metrics scraping, and persistent node keys.
 
 ### Build your own app (with tickets)
 
@@ -301,7 +319,7 @@ Client with cookie ticket:
 ```python
 from betanet.sdk import make_ticket_params, make_ticket_cookie
 
-
+# values printed by the server
 ticket_pub_hex = "..."
 ticket_key_id_hex = "..."
 
