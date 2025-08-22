@@ -1,0 +1,52 @@
+# Betanet 1.2 Server  Configuration
+
+
+[server]
+host = "127.0.0.1"
+port = 35100
+transport = "tcp12"
+profile = "STANDARD"
+pq_enabled = false
+
+# Encryption suite (fixed by the 1.2 spec; shown here for clarity):
+# L2 Noise suite = Noise_XK_25519_ChaChaPoly_SHA256 (non-configurable)
+# AEAD = ChaCha20-Poly1305, Nonce = NonceSalt XOR (u64_le(counter)||0x00000000)
+# KEY_UPDATE uses HKDF-Expand-Label(ts, "next", 32) with 3-frame overlap
+
+# Advertised capabilities on L3 capability exchange (optional). If omitted, defaults are used.
+# [server.caps]
+# l2 = ["betanet/htx/1.2.0"]
+# l3 = ["betanet/mesh/1.2.0"]
+# l4 = []
+# l5 = []
+
+# Optional HTTP gateway to proxy HTTP to Betanet (HTX over tcp12)
+[gateway]
+listen_host = "127.0.0.1"
+listen_port = 8082
+upstream_host = "127.0.0.1"
+upstream_port = 35100
+transport = "tcp12"
+
+# Cookie tickets (optional). If set, clients must present a valid cookie or 403 is returned.
+ticket_cookie_name = "__Host-bn1"
+# For demo only; in production load from secure storage
+# ticket_key_id_hex = "0000000000000000"
+# ticket_priv_hex = "<hex of 32 bytes>"
+
+# Vouchers (L6) (optional). If enabled, clients must send a valid voucher header.
+# require_voucher = true
+# voucher_header = "BN-Voucher"
+
+# BN‑Ticket header (Section 6.4) is validated by the gateway.
+# If you set cookie tickets above, clients must present a valid cookie; otherwise gateway returns 403.
+
+# Compliance profile (Section 19) is controlled via [server].profile:
+# MINIMAL: L1, L2 (TLS), L3, L7
+# STANDARD: MINIMAL plus QUIC/L4/L5 and indistinguishability checks
+# EXTENDED: STANDARD plus L6 (payments)
+
+# Calibration/TemplateID (Section 8.1.1) example (not required for this demo):
+# This server runs a dev tcp12 transport. For production indistinguishability,
+# run the outer transport wrapper against a real origin and persist TemplateID.
+# The gateway in this demo provides an HTTP ingress only; it does not perform outer TLS origin mirroring.

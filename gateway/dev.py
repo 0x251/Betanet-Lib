@@ -1,14 +1,21 @@
 import socket
-from typing import Optional
+from typing import Optional, Callable, Tuple, List
 import h11
 import logging
+import importlib, importlib.util
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from betanet.transport.tcp import HtxTcpClientPersistent
+from betanet.transport.tcp12 import Tcp12Client, Tcp12ClientPersistent
+from betanet.compliance import active_profile, profile_flags
 from betanet.transport.fallback import roundtrip_with_udp_fallback
 from betanet.path import PathManager, PathEndpoint
 from betanet.gateway.enums import TicketCarrier, HttpMethod
 from betanet.gateway.types import RequestHead, UpstreamMessage
 from betanet.tickets import TicketVerifier
+from betanet.payments import parse_voucher
+from betanet.core.bn_ticket import validate_header
 
 
 logger = logging.getLogger("betanet")
@@ -101,6 +108,10 @@ def _send_response(
     conn.sendall(c.send(h11.EndOfMessage()))
 
 
+# Signature for a lightweight request pre-handler: (method, path, headers, body) -> Optional(response)
+PreHandler = Callable[[bytes, bytes, dict[bytes, bytes], bytes], Optional[Tuple[int, List[Tuple[bytes, bytes]], bytes]]]
+
+
 class ProxyServer:
     def __init__(
         self,
@@ -112,6 +123,10 @@ class ProxyServer:
         server_pub: bytes,
         ticket_verifier: Optional[TicketVerifier] = None,
         ticket_cookie_name: Optional[str] = None,
+        require_voucher: bool = False,
+        voucher_header: bytes = b"BN-Voucher",
+        pre_handler: Optional[PreHandler] = None,
+        routes_module: Optional[str] = None,
         forward_path: bool = False,
         transport: str = "tcp",
     ):
@@ -123,12 +138,46 @@ class ProxyServer:
         self.server_pub = server_pub
         self.ticket_verifier = ticket_verifier
         self.ticket_cookie_name = ticket_cookie_name
+        self.require_voucher = require_voucher
+        self.voucher_header = voucher_header
         self.forward_path = forward_path
         self.transport = (transport or "tcp").lower().strip()
         self.up_client: Optional[HtxTcpClientPersistent] = None
         self.paths = PathManager(
             [PathEndpoint(upstream_host, upstream_port)], max_paths=3
         )
+        self.pre_handler = pre_handler or self._load_pre_handler(routes_module)
+        self.cli12_persist: Optional[Tcp12ClientPersistent] = None
+        self._pool_size = 4
+        self._cli12_pool: List[Tcp12ClientPersistent] = []
+        self._pool_idx = 0
+        self._pool_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=self._pool_size)
+        self.verbose = False
+
+    def _load_pre_handler(self, mod: Optional[str]) -> Optional[PreHandler]:
+        if not mod:
+            return None
+        try:
+            module = None
+            if mod.endswith(".py"):
+                spec = importlib.util.spec_from_file_location("betanet_routes", mod)
+                if not spec or not spec.loader:
+                    logger.warning("routes_module_invalid path=%s", mod)
+                    return None
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)  # type: ignore
+            else:
+                module = importlib.import_module(mod)
+            h = getattr(module, "handle", None)
+            if callable(h):
+                logger.info("pre_handler_loaded module=%s", mod)
+                return h  # type: ignore[return-value]
+            logger.warning("handle(req) not found in %s", mod)
+            return None
+        except Exception as e:
+            logger.error("routes_load_error module=%s err=%r", mod, e)
+            return None
 
     def serve_once(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -168,6 +217,12 @@ class ProxyServer:
             if self.ticket_verifier is not None and self.ticket_cookie_name:
                 carrier = None
                 val = None
+                hv = headers.get(b"bn-ticket")
+                if hv is not None:
+                    ok, why = validate_header(b"BN-Ticket", hv)
+                    if not ok:
+                        _send_response(conn, c, 400, b"")
+                        return
 
                 cv = headers.get(b"cookie")
                 if cv is not None:
@@ -209,6 +264,18 @@ class ProxyServer:
                     logger.warning("forbid reason=bad_ticket")
                     _send_response(conn, c, 403, b"")
                     return
+            if self.require_voucher:
+                vh = headers.get(self.voucher_header.lower())
+                if not vh:
+                    logger.warning("forbid reason=no_voucher")
+                    _send_response(conn, c, 403, b"")
+                    return
+                try:
+                    _ = parse_voucher(vh)
+                except Exception:
+                    logger.warning("forbid reason=bad_voucher")
+                    _send_response(conn, c, 403, b"")
+                    return
             try:
                 cl_val = int(
                     headers.get(b"content-length", b"0").decode(errors="ignore") or "0"
@@ -223,6 +290,17 @@ class ProxyServer:
             req_obj = RequestHead(
                 method=method, path=path, headers=headers, content_length=len(body)
             )
+            # Pre-handler hook: application may serve without upstreaming
+            if self.pre_handler is not None:
+                try:
+                    res = self.pre_handler(method.value.encode(), path, headers, body)
+                except Exception as e:
+                    logger.error("pre_handler_exception err=%r", e)
+                    res = None
+                if res is not None:
+                    status, hdrs, resp_body = res
+                    _send_response(conn, c, status, resp_body, hdrs)
+                    return
             if not self.forward_path:
                 umsg = UpstreamMessage(
                     method=req_obj.method, path=req_obj.path, body=body
@@ -245,7 +323,11 @@ class ProxyServer:
 
             _t0 = _t.perf_counter()
             try:
+                flags = profile_flags(active_profile())
                 if self.transport == "quic":
+                    if not flags.get("allow_quic", False):
+                        _send_response(conn, c, 403, b"")
+                        return
                     resp_body = roundtrip_with_udp_fallback(
                         cur.host,
                         cur.port,
@@ -255,6 +337,9 @@ class ProxyServer:
                         payload,
                         sleep_ms=lambda ms: None,
                     )
+                elif self.transport == "tcp12":
+                    cli12 = Tcp12ClientPersistent(cur.host, cur.port, self.client_priv, self.server_pub)
+                    resp_body = cli12.roundtrip(payload)
                 else:
                     if self.up_client is None:
                         self.up_client = HtxTcpClientPersistent(
@@ -289,15 +374,16 @@ class ProxyServer:
         except Exception:
             pass
         s.bind((self.listen_host, self.listen_port))
-        s.listen(64)
-        while True:
-            conn, addr = s.accept()
+        s.listen(128)
+        import threading as _th
+        def _serve_conn(conn, addr):
             try:
                 try:
                     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 except Exception:
                     pass
-                logger.info("conn addr=%s", addr)
+                if self.verbose:
+                    logger.info("conn addr=%s", addr)
                 try:
                     method_bytes, path, headers, body, c = _read_request(conn)
                 except Exception as e:
@@ -310,19 +396,25 @@ class ProxyServer:
                     ):
                         _send_response(conn, c, 431, b"")
                         conn.close()
-                        continue
+                        return
                     if "body too large" in emsg or "too large" in emsg:
                         _send_response(conn, c, 413, b"")
                         conn.close()
-                        continue
+                        return
                     _send_response(conn, c, 400, b"")
                     conn.close()
-                    continue
+                    return
 
                 if self.ticket_verifier is not None and self.ticket_cookie_name:
                     carrier = None
                     val = None
-                    # cookie
+                    hv = headers.get(b"bn-ticket")
+                    if hv is not None:
+                        ok, why = validate_header(b"BN-Ticket", hv)
+                        if not ok:
+                            _send_response(conn, c, 400, b"")
+                            conn.close()
+                            return
                     cv = headers.get(b"cookie")
                     if cv is not None:
                         parts = [p.strip() for p in cv.split(b";")]
@@ -332,7 +424,6 @@ class ProxyServer:
                                 val = p.split(b"=", 1)[1].decode()
                                 carrier = TicketCarrier.COOKIE.value
                                 break
-                    # query
                     if val is None:
                         q = path.split(b"?", 1)
                         if len(q) == 2:
@@ -341,7 +432,6 @@ class ProxyServer:
                                     val = part.split(b"=", 1)[1].decode()
                                     carrier = TicketCarrier.QUERY.value
                                     break
-                    # form body
                     if val is None and body:
                         ctype = headers.get(b"content-type", b"").lower()
                         if b"application/x-www-form-urlencoded" in ctype:
@@ -350,21 +440,24 @@ class ProxyServer:
                                     val = part.split(b"=", 1)[1].decode()
                                     carrier = TicketCarrier.BODY.value
                                     break
-                    logger.info("carrier %s", carrier)
+                    if self.verbose:
+                        logger.info("carrier %s", carrier)
                     if not val:
                         logger.warning("forbid reason=no_ticket")
                         _send_response(conn, c, 403, b"")
                         conn.close()
-                        continue
+                        return
                     ip = conn.getpeername()[0]
-                    logger.info("client_ip %s", ip)
+                    if self.verbose:
+                        logger.info("client_ip %s", ip)
                     ok = self.ticket_verifier.parse_and_verify(val, ip)
-                    logger.info("ticket_ok %s", ok)
+                    if self.verbose:
+                        logger.info("ticket_ok %s", ok)
                     if not ok:
                         logger.warning("forbid reason=bad_ticket")
                         _send_response(conn, c, 403, b"")
                         conn.close()
-                        continue
+                        return
                 try:
                     cl_val = int(
                         headers.get(b"content-length", b"0").decode(errors="ignore")
@@ -372,7 +465,21 @@ class ProxyServer:
                     )
                 except Exception:
                     cl_val = 0
-                logger.info("content_length %d body_len %d", cl_val, len(body))
+                if self.verbose:
+                    logger.info("content_length %d body_len %d", cl_val, len(body))
+
+                if self.pre_handler is not None:
+                    try:
+                        fut = self._executor.submit(self.pre_handler, method_bytes, path, headers, body)
+                        res = fut.result()
+                    except Exception as e:
+                        logger.error("pre_handler_exception err=%r", e)
+                        res = None
+                    if res is not None:
+                        status, hdrs, resp_body = res
+                        _send_response(conn, c, status, resp_body, hdrs)
+                        conn.close()
+                        return
 
                 if not self.forward_path:
                     payload = body
@@ -396,6 +503,16 @@ class ProxyServer:
                             payload,
                             sleep_ms=lambda ms: None,
                         )
+                    elif self.transport == "tcp12":
+                        # small pool for concurrency
+                        with self._pool_lock:
+                            if not self._cli12_pool:
+                                for _ in range(self._pool_size):
+                                    self._cli12_pool.append(Tcp12ClientPersistent(cur.host, cur.port, self.client_priv, self.server_pub))
+                            cli = self._cli12_pool[self._pool_idx % len(self._cli12_pool)]
+                            self._pool_idx = (self._pool_idx + 1) % len(self._cli12_pool)
+                        cli.rebind(cur.host, cur.port)
+                        resp_body = cli.roundtrip(payload)
                     else:
                         if self.up_client is None:
                             self.up_client = HtxTcpClientPersistent(
@@ -410,7 +527,8 @@ class ProxyServer:
                 except Exception:
                     self.paths.mark_fail(cur.host, cur.port)
                     raise
-                logger.info("resp_len %d", len(resp_body))
+                if self.verbose:
+                    logger.info("resp_len %d", len(resp_body))
                 _send_response(conn, c, 200, resp_body)
             except Exception as e:
                 logger.error("proxy_exception err=%r", e)
@@ -425,3 +543,6 @@ class ProxyServer:
                     pass
             finally:
                 conn.close()
+        while True:
+            conn, addr = s.accept()
+            _th.Thread(target=_serve_conn, args=(conn, addr), daemon=True).start()

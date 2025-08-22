@@ -1,4 +1,6 @@
 import json
+import hashlib
+import time
 import os
 import logging
 import socket
@@ -8,6 +10,11 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Set, Optional, Protocol
 from enum import Enum
 from json import JSONDecodeError
+
+from betanet.core.detcbor import dumps as detcbor_dumps
+def _safe_dirname(origin: str) -> str:
+    return origin.replace(":", "_")
+
 
 
 @dataclass
@@ -55,8 +62,8 @@ def verify(
         cv = calibrated.h2_settings[k]
         ov = observed.h2_settings[k]
         if k in calibrated.tolerant_settings:
-            low = int(cv - max(1, round(cv * 0.15)))
-            high = int(cv + max(1, round(cv * 0.15)))
+            low = int(cv - max(1, round(cv * 0.10)))
+            high = int(cv + max(1, round(cv * 0.10)))
             if not (low <= ov <= high):
                 reasons.append(f"h2_setting_out_of_tolerance:{k}")
         else:
@@ -103,7 +110,7 @@ def _fp_dir() -> str:
 
 
 def save_fingerprint(origin: str, pop: str, fp: OriginFingerprint) -> None:
-    d = os.path.join(_fp_dir(), origin)
+    d = os.path.join(_fp_dir(), _safe_dirname(origin))
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, f"{pop}.json")
     payload = asdict(fp)
@@ -116,8 +123,51 @@ def save_fingerprint(origin: str, pop: str, fp: OriginFingerprint) -> None:
     os.replace(tmp, p)
 
 
+def _template_path(origin: str, pop: str) -> str:
+    d = os.path.join(_fp_dir(), _safe_dirname(origin))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{pop}.template.json")
+
+
+def compute_template_id(fp: OriginFingerprint) -> bytes:
+    h2_items = sorted((k, int(v)) for k, v in fp.h2_settings.items())
+    m = {
+        "alpn": fp.alpn,
+        "grease": bool(fp.grease),
+        "h2": {k: v for k, v in h2_items},
+    }
+    enc = detcbor_dumps(m)
+    return hashlib.sha256(enc).digest()
+
+
+def save_template_id(origin: str, pop: str, template_id: bytes) -> None:
+    p = _template_path(origin, pop)
+    payload = {"template_id": template_id.hex(), "ts": int(os.path.getmtime(p) if os.path.exists(p) else 0)}
+    payload["ts"] = int(time.time())
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, p)
+
+
+def load_template_id(origin: str, pop: str) -> Optional[Tuple[bytes, int]]:
+    p = _template_path(origin, pop)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tid_hex = str(data.get("template_id", ""))
+        ts = int(data.get("ts", 0))
+        if len(tid_hex) != 64:
+            return None
+        return bytes.fromhex(tid_hex), ts
+    except Exception:
+        return None
+
+
 def load_fingerprint(origin: str, pop: str) -> Optional[OriginFingerprint]:
-    p = os.path.join(_fp_dir(), origin, f"{pop}.json")
+    p = os.path.join(_fp_dir(), _safe_dirname(origin), f"{pop}.json")
     if not os.path.exists(p):
         return None
     try:
@@ -242,6 +292,15 @@ def ensure_calibrated(
         attempts += 1
         baseline = load_fingerprint(origin, pop)
         observed = provider.collect(origin, pop)
+
+        
+        tid = compute_template_id(observed)
+        cached = load_template_id(origin, pop)
+        cached_tid, cached_ts = (cached[0], cached[1]) if cached else (None, 0)
+        stale = (time.time() - cached_ts) >= 24 * 3600 if cached_ts else True
+        if cached_tid is None or cached_tid != tid or stale:
+            save_template_id(origin, pop, tid)
+            logger.info("template_updated origin=%s pop=%s", origin, pop)
 
         if baseline is None:
             save_fingerprint(origin, pop, observed)
